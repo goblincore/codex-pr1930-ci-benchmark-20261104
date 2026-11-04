@@ -1,0 +1,184 @@
+name: PR 1930 isolated timing benchmark
+'on':
+  workflow_dispatch: {}
+permissions:
+  contents: read
+  actions: read
+env:
+  CI: 'true'
+  MONGOMS_DISABLE_POSTINSTALL: '1'
+jobs:
+  baseline-image:
+    name: baseline ARM64 image
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    services:
+      registry:
+        image: registry:2
+        ports:
+        - 5000:5000
+    steps:
+    - name: Checkout tested LearnCard commit
+      uses: actions/checkout@v7
+      with:
+        repository: learningeconomy/LearnCard
+        ref: 2c75125b4e03dfb2cc7579cfa5b796b3519e3ac4
+        path: source
+        persist-credentials: false
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+      with:
+        platforms: arm64
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      with:
+        driver-opts: network=host
+        buildkitd-config-inline: "[registry.\"localhost:5000\"]\n  http = true"
+        cleanup: true
+    - name: Build and push AI Agent image to local registry
+      id: build
+      uses: docker/build-push-action@v6
+      with:
+        context: source
+        file: source/services/learn-card-network/ai-agent/Dockerfile
+        push: true
+        platforms: linux/arm64
+        build-args: GIT_SHA=2c75125b4e03dfb2cc7579cfa5b796b3519e3ac4
+        tags: localhost:5000/learncard/ai-agent:baseline
+        cache-from: type=gha,scope=ai-agent-image
+        cache-to: type=gha,mode=max,scope=ai-agent-image
+    - name: Verify local ARM64 image manifest
+      run: docker buildx imagetools inspect localhost:5000/learncard/ai-agent:baseline
+  pr-image:
+    name: pr ARM64 image
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    services:
+      registry:
+        image: registry:2
+        ports:
+        - 5000:5000
+    steps:
+    - name: Checkout tested LearnCard commit
+      uses: actions/checkout@v7
+      with:
+        repository: learningeconomy/LearnCard
+        ref: 4bd09aa9eb0a6b9a9faf0d5942996cdf98f18097
+        path: source
+        persist-credentials: false
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+      with:
+        platforms: arm64
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      with:
+        driver-opts: network=host
+        buildkitd-config-inline: "[registry.\"localhost:5000\"]\n  http = true"
+        cleanup: false
+    - name: Build and push AI Agent image to local registry
+      id: build
+      uses: docker/build-push-action@v6
+      with:
+        context: source
+        file: source/services/learn-card-network/ai-agent/Dockerfile
+        push: true
+        platforms: linux/arm64
+        build-args: GIT_SHA=4bd09aa9eb0a6b9a9faf0d5942996cdf98f18097
+        tags: localhost:5000/learncard/ai-agent:pr
+    - name: Verify local ARM64 image manifest
+      run: docker buildx imagetools inspect localhost:5000/learncard/ai-agent:pr
+  baseline-native:
+    name: baseline native DIDKit build (cold isolated cache)
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Repo
+      uses: actions/checkout@v7
+      with:
+        submodules: true
+        repository: learningeconomy/LearnCard
+        ref: 2c75125b4e03dfb2cc7579cfa5b796b3519e3ac4
+        path: source
+        persist-credentials: false
+    - name: Setup Bun
+      uses: oven-sh/setup-bun@v2
+      with:
+        bun-version: 1.4.4
+    - name: Setup Bun cache
+      uses: actions/cache@v6
+      with:
+        path: ~/.bun/install/cache
+        key: ${{ runner.os }}-bun-${{ hashFiles('source/bun.lock') }}
+        restore-keys: '${{ runner.os }}-bun-
+
+          '
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: stable
+        targets: x86_64-unknown-linux-gnu
+    - name: Cache cargo
+      uses: actions/cache@v6
+      with:
+        path: '~/.cargo/registry/index/
+
+          ~/.cargo/registry/cache/
+
+          ~/.cargo/git/db/
+
+          source/packages/plugins/didkit-plugin-node/native/target/
+
+          '
+        key: linux-x64-cargo-${{ hashFiles('**/Cargo.lock') }}
+    - name: Install dependencies
+      run: bun install --frozen-lockfile
+    - name: Build native plugin
+      working-directory: source/packages/plugins/didkit-plugin-node
+      env:
+        BUILD_DIDKIT_NAPI: true
+      run: 'bunx nx build didkit-plugin-node
+
+        strip -x *.node
+
+        '
+    - name: Upload native binary
+      uses: actions/upload-artifact@v4
+      with:
+        name: didkit-native-linux-x64
+        path: 'source/packages/plugins/didkit-plugin-node/*.node
+
+          source/packages/plugins/didkit-plugin-node/dist/**
+
+          '
+        if-no-files-found: error
+        retention-days: 1
+    defaults:
+      run:
+        working-directory: source
+  pr-selector:
+    name: 'PR native selection: AI Agent only'
+    runs-on: ubuntu-latest
+    outputs:
+      needed: ${{ steps.native-plugin.outputs.needed }}
+    steps:
+    - name: Determine whether the native DIDKit plugin is needed
+      id: native-plugin
+      env:
+        IS_MANUAL: 'true'
+        IS_RELEASE: 'false'
+        AFFECTED: ''
+        MANUAL_SERVICES: false,false,false
+        RELEASE_SERVICES: false,false,false
+      run: "needed=false\nif [[ \"$IS_MANUAL\" == 'true' ]]; then\n  [[ \",$MANUAL_SERVICES,\" == *,true,* ]] && needed=true\n\
+        elif [[ \"$IS_RELEASE\" == 'true' ]]; then\n  [[ \",$RELEASE_SERVICES,\" == *,true,* ]] && needed=true\nelse\n  #\
+        \ Substring match, like the deploy jobs' contains().\n  for project in network-brain-service learn-cloud-service lca-api-service;\
+        \ do\n    [[ \"$AFFECTED\" == *\"$project\"* ]] && needed=true\n  done\nfi\necho \"needed=$needed\" >> \"$GITHUB_OUTPUT\"\
+        \necho \"Native DIDKit plugin needed: $needed\"\n"
+  pr-native:
+    name: 'PR native DIDKit build: AI Agent only'
+    needs:
+    - pr-selector
+    if: needs.pr-selector.outputs.needed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+    - run: echo "Native DIDKit build would run"
